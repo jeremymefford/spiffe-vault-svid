@@ -1,0 +1,9 @@
+infra/pki/*.key
+infra/pki/*.crt
+infra/pki/*.pem
+legacy-app/lab.env
+legacy-app/target/
+modern-app/modern-app
+.lab/
+.cache/
+.DS_Store

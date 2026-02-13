@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-agent
+  namespace: spire
+data:
+  agent.conf: |
+    agent {
+      data_dir = "/run/spire/agent-data"
+      log_level = "DEBUG"
+      server_address = "spire-server.spire.svc"
+      server_port = "8081"
+      trust_domain = "modern.lab"
+      insecure_bootstrap = true
+      socket_path = "/run/spire/sockets/agent.sock"
+    }
+
+    plugins {
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          cluster = "kind-spiffe"
+          token_path = "/var/run/secrets/tokens/spire-agent"
+        }
+      }
+
+      KeyManager "memory" {
+        plugin_data = {}
+      }
+
+      WorkloadAttestor "unix" {
+        plugin_data = {}
+      }
+    }
+
+    health_checks {
+      listener_enabled = true
+      bind_address = "0.0.0.0"
+      bind_port = "8080"
+      live_path = "/live"
+      ready_path = "/ready"
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spire-agent
+  namespace: spire
+spec:
+  selector:
+    matchLabels:
+      app: spire-agent
+  template:
+    metadata:
+      labels:
+        app: spire-agent
+    spec:
+      hostPID: true
+      serviceAccountName: spire-agent
+      containers:
+        - name: spire-agent
+          image: ghcr.io/spiffe/spire-agent:1.11.2
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config
+            - /run/spire/config/agent.conf
+          ports:
+            - containerPort: 8080
+              name: health
+          securityContext:
+            privileged: true
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: spire-config
+              mountPath: /run/spire/config
+              readOnly: true
+            - name: spire-agent-data
+              mountPath: /run/spire/agent-data
+            - name: spire-agent-sockets
+              mountPath: /run/spire/sockets
+            - name: spire-agent-token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
+      volumes:
+        - name: spire-config
+          configMap:
+            name: spire-agent
+        - name: spire-agent-data
+          hostPath:
+            path: /run/spire/agent-data-modern
+            type: DirectoryOrCreate
+        - name: spire-agent-sockets
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: spire-agent-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: spire-agent
+                  audience: spire-server
+                  expirationSeconds: 3600

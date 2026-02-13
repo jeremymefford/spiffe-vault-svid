@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: modern
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modern-app
+  namespace: modern
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modern-app
+  namespace: modern
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modern-app
+  template:
+    metadata:
+      labels:
+        app: modern-app
+    spec:
+      serviceAccountName: modern-app
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: modern-app
+          image: modern-app:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/sockets/agent.sock
+            - name: EXPECTED_CLIENT_SPIFFE_ID
+              value: spiffe://legacy.lab/ns/legacy/sa/springboot
+            - name: MODERN_SERVER_SPIFFE_ID
+              value: spiffe://modern.lab/ns/modern/sa/go
+          ports:
+            - containerPort: 8443
+              name: tls
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modern-app
+  namespace: modern
+spec:
+  selector:
+    app: modern-app
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+      nodePort: 30443
+  type: NodePort
