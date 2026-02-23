@@ -16,6 +16,27 @@ Two trust domains, two runtimes, one mTLS handshake:
 | Vault Enterprise | Nomad service | `legacy.lab` | — |
 | SPIRE | Kubernetes | `modern.lab` | — |
 
+```mermaid
+flowchart LR
+    subgraph K8s ["Kubernetes"]
+        SPIRE["SPIRE<br/><i>modern.lab</i>"]
+        Modern["modern-app<br/>(Go)"]
+    end
+
+    subgraph Nomad
+        Vault["Vault Enterprise<br/><i>legacy.lab</i>"]
+        Legacy["legacy-app<br/>(Spring Boot)"]
+    end
+
+    SPIRE -- "x509-SVID +<br/>JWT-SVID" --> Modern
+    SPIRE -. "federated<br/>legacy.lab bundle" .-> Modern
+    Legacy -- "1 AppRole login" --> Vault
+    Vault -- "2 x509-SVID +<br/>KV v2 secret" --> Legacy
+    Modern -- "3 JWT-SVID<br/>(SPIFFE auth)" --> Vault
+    Vault -- "4 KV v2 secret" --> Modern
+    Legacy == "5 mTLS" ==> Modern
+```
+
 **Data flow:**
 
 1. Legacy app logs into Vault via AppRole, mints a short-lived x509-SVID (`spiffe://legacy.lab/ns/legacy/sa/springboot`), and reads a KV v2 secret.
