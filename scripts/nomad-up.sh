@@ -10,6 +10,7 @@ NOMAD_PID_FILE="${LAB_DIR}/nomad/nomad.pid"
 NOMAD_LOG_FILE="${LAB_DIR}/nomad/nomad.log"
 VAULT_JOB_TEMPLATE="${ROOT_DIR}/nomad/vault.nomad.tmpl.hcl"
 VAULT_JOB_RENDERED="${ROOT_DIR}/.lab/generated/vault.nomad.hcl"
+VAULT_LICENSE_FILE="${LAB_DIR}/vault.hclic"
 
 require() {
   command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; exit 1; }
@@ -18,8 +19,13 @@ require() {
 require nomad
 require docker
 require curl
+require jq
 
 : "${LAB_VAULT_DEV_ROOT_TOKEN:?LAB_VAULT_DEV_ROOT_TOKEN must be set}"
+if [[ ! -f "${VAULT_LICENSE_FILE}" || ! -s "${VAULT_LICENSE_FILE}" ]]; then
+  echo "Missing Vault Enterprise license at ${VAULT_LICENSE_FILE}" >&2
+  exit 1
+fi
 
 LAB_DOCKER_HOST="${DOCKER_HOST:-}"
 if [[ -z "${LAB_DOCKER_HOST}" ]]; then
@@ -41,6 +47,14 @@ export DOCKER_CONFIG="${LAB_DOCKER_CONFIG_DIR}"
 if [[ -n "${LAB_DOCKER_HOST}" ]]; then
   export DOCKER_HOST="${LAB_DOCKER_HOST}"
 fi
+
+escape_sed_replacement() {
+  printf '%s' "$1" | sed -e 's/[|&\\]/\\&/g'
+}
+
+escape_hcl_string() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
 
 nomad_ready() {
   curl -fsS "${NOMAD_ADDR}/v1/status/leader" >/dev/null 2>&1
@@ -78,7 +92,17 @@ else
 fi
 
 mkdir -p "${ROOT_DIR}/.lab/generated"
-sed "s|__LAB_VAULT_DEV_ROOT_TOKEN__|${LAB_VAULT_DEV_ROOT_TOKEN}|g" \
+vault_license_raw="$(< "${VAULT_LICENSE_FILE}")"
+vault_license_raw="${vault_license_raw//$'\r'/}"
+vault_license_raw="${vault_license_raw//$'\n'/\\n}"
+vault_license_escaped="$(escape_hcl_string "${vault_license_raw}")"
+
+vault_local_config="$(jq -c -n '{storage:{raft:{path:"/vault/data",node_id:"vault-1"}},listener:[{tcp:{address:"0.0.0.0:8200",tls_disable:1}}],api_addr:"http://127.0.0.1:18200",cluster_addr:"http://127.0.0.1:18201",ui:true,disable_mlock:true}')"
+vault_local_config_escaped="$(escape_hcl_string "${vault_local_config}")"
+sed \
+  -e "s|__LAB_VAULT_DEV_ROOT_TOKEN__|$(escape_sed_replacement "${LAB_VAULT_DEV_ROOT_TOKEN}")|g" \
+  -e "s|__LAB_VAULT_LICENSE__|$(escape_sed_replacement "${vault_license_escaped}")|g" \
+  -e "s|__LAB_VAULT_LOCAL_CONFIG__|$(escape_sed_replacement "${vault_local_config_escaped}")|g" \
   "${VAULT_JOB_TEMPLATE}" > "${VAULT_JOB_RENDERED}"
 
 echo "Submitting Vault job to Nomad"
@@ -122,12 +146,73 @@ if [[ "${vault_client_status}" != "running" ]]; then
 fi
 
 echo "Waiting for Vault at http://127.0.0.1:18200"
-for _ in $(seq 1 90); do
-  health_code="$(curl --connect-timeout 2 --max-time 3 -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18200/v1/sys/health?standbyok=true&perfstandbyok=true&sealedcode=503&uninitcode=501" || true)"
-  if [[ "${health_code}" == "200" ]]; then
-    echo "Vault is reachable"
-    exit 0
+VAULT_HEALTH_URL="http://127.0.0.1:18200/v1/sys/health?standbyok=true&perfstandbyok=true&sealedcode=503&uninitcode=501"
+VAULT_UNSEAL_FILE="${LAB_DIR}/vault-unseal.key"
+
+update_env_file() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+
+  awk -v key="${key}" -v value="${value}" '
+    BEGIN {found=0}
+    $0 ~ "^export "key"=" {print "export "key"="value; found=1; next}
+    {print}
+    END {if (!found) print "export "key"="value}
+  ' "${file}" > "${file}.tmp"
+  mv "${file}.tmp" "${file}"
+}
+
+init_vault() {
+  local init_resp
+  init_resp="$(curl -fsS -X PUT -H "Content-Type: application/json" \
+    -d '{"secret_shares":1,"secret_threshold":1}' \
+    "http://127.0.0.1:18200/v1/sys/init")"
+
+  local root_token
+  local unseal_key
+  root_token="$(printf '%s' "${init_resp}" | jq -r '.root_token // empty')"
+  unseal_key="$(printf '%s' "${init_resp}" | jq -r '.keys_base64[0] // empty')"
+  if [[ -z "${root_token}" || -z "${unseal_key}" ]]; then
+    echo "Failed to initialize Vault" >&2
+    exit 1
   fi
+
+  printf '%s' "${unseal_key}" > "${VAULT_UNSEAL_FILE}"
+  chmod 600 "${VAULT_UNSEAL_FILE}"
+
+  update_env_file "${ROOT_DIR}/.lab/lab-secrets.env" "LAB_VAULT_DEV_ROOT_TOKEN" "${root_token}"
+  export LAB_VAULT_DEV_ROOT_TOKEN="${root_token}"
+}
+
+unseal_vault() {
+  if [[ ! -f "${VAULT_UNSEAL_FILE}" ]]; then
+    echo "Missing ${VAULT_UNSEAL_FILE} to unseal Vault" >&2
+    exit 1
+  fi
+  local unseal_key
+  unseal_key="$(< "${VAULT_UNSEAL_FILE}")"
+  curl -fsS -X PUT -H "Content-Type: application/json" \
+    -d "{\"key\":\"${unseal_key}\"}" \
+    "http://127.0.0.1:18200/v1/sys/unseal" >/dev/null
+}
+
+for _ in $(seq 1 90); do
+  health_code="$(curl --connect-timeout 2 --max-time 3 -s -o /dev/null -w '%{http_code}' "${VAULT_HEALTH_URL}" || true)"
+  case "${health_code}" in
+    200)
+      echo "Vault is reachable"
+      exit 0
+      ;;
+    501)
+      echo "Vault is uninitialized, initializing"
+      init_vault
+      ;;
+    503)
+      echo "Vault is sealed, unsealing"
+      unseal_vault
+      ;;
+  esac
   sleep 1
 done
 

@@ -58,6 +58,9 @@ echo "Starting Nomad and deploying Vault"
 LAB_VAULT_DEV_ROOT_TOKEN="${LAB_VAULT_DEV_ROOT_TOKEN}" \
   "${ROOT_DIR}/scripts/nomad-up.sh"
 
+# Reload secrets in case Vault initialization updated the root token
+source "${ROOT_DIR}/.lab/lab-secrets.env"
+
 echo "Configuring Vault PKI + AppRole"
 VAULT_ADDR="http://127.0.0.1:18200" \
 LAB_VAULT_ADDR_NOMAD="http://host.docker.internal:18200" \
@@ -84,6 +87,11 @@ kubectl rollout status daemonset/spire-agent -n spire --timeout=180s
 
 echo "Registering modern app workload in SPIRE"
 "${ROOT_DIR}/scripts/configure-spire.sh"
+
+echo "Configuring Vault SPIFFE auth"
+VAULT_ADDR="http://127.0.0.1:18200" \
+VAULT_TOKEN="${LAB_VAULT_DEV_ROOT_TOKEN}" \
+  "${ROOT_DIR}/scripts/configure-vault-spiffe.sh"
 
 echo "Building and loading modern app image"
 docker build -t modern-app:latest "${ROOT_DIR}/modern-app"

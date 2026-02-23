@@ -1,21 +1,26 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 )
@@ -40,6 +45,12 @@ func main() {
 	}
 	defer source.Close()
 
+	jwtSource, err := workloadapi.NewJWTSource(ctx)
+	if err != nil {
+		log.Fatalf("failed to create SPIFFE jwt source: %v", err)
+	}
+	defer jwtSource.Close()
+
 	serverSVID, err := waitForSVID(ctx, source)
 	if err != nil {
 		log.Fatalf("failed to fetch server SVID: %v", err)
@@ -47,6 +58,14 @@ func main() {
 	if serverSVID.ID != expectedServerID {
 		log.Fatalf("unexpected server SPIFFE ID: got=%s want=%s", serverSVID.ID.String(), expectedServerID.String())
 	}
+
+	vaultClient := newVaultClient(
+		getEnv("VAULT_ADDR", "http://host.docker.internal:18200"),
+		getEnv("VAULT_KV_PATH", "kv/data/legacy-app"),
+		getEnv("VAULT_SPIFFE_ROLE", "modern-app"),
+		getEnv("SPIFFE_JWT_AUDIENCE", "vault"),
+		jwtSource,
+	)
 
 	tlsConfig := tlsconfig.MTLSServerConfig(source, source, tlsconfig.AuthorizeID(expectedPeerID))
 	tlsConfig.MinVersion = tls.VersionTLS12
@@ -67,6 +86,14 @@ func main() {
 		log.Printf("received request from legacy client %s", peerID.String())
 		logPeerCertificate(r.TLS.PeerCertificates[0])
 		logClientCertHeaders(r.Header)
+		if vaultClient != nil {
+			message, err := vaultClient.ReadKV(r.Context())
+			if err != nil {
+				log.Printf("vault kv read failed: %v", err)
+			} else if message != "" {
+				log.Printf("Vault KV v2 message: %s", message)
+			}
+		}
 
 		fmt.Fprintf(w, "modern app (%s) accepted client %s\n", serverSVID.ID.String(), peerID.String())
 	})
@@ -125,15 +152,25 @@ func logPeerCertificate(cert *x509.Certificate) {
 	if cert == nil {
 		return
 	}
-	block := &pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: cert.Raw,
+	cn := cert.Subject.CommonName
+	if cn == "" {
+		cn = "(empty)"
 	}
-	pemBytes := pem.EncodeToMemory(block)
-	if len(pemBytes) == 0 {
-		return
+	log.Printf("peer certificate subject CN: %s", cn)
+	if len(cert.DNSNames) > 0 {
+		log.Printf("peer certificate DNS SANs: %v", cert.DNSNames)
 	}
-	log.Printf("peer mTLS certificate (PEM):\n%s", string(pemBytes))
+	if len(cert.URIs) > 0 {
+		uriSans := make([]string, 0, len(cert.URIs))
+		for _, uri := range cert.URIs {
+			if uri != nil {
+				uriSans = append(uriSans, uri.String())
+			}
+		}
+		if len(uriSans) > 0 {
+			log.Printf("peer certificate URI SANs: %v", uriSans)
+		}
+	}
 }
 
 func logClientCertHeaders(header http.Header) {
@@ -156,4 +193,138 @@ func logClientCertHeaders(header http.Header) {
 	if !found {
 		log.Print("no client certificate header found; using mTLS peer certificate")
 	}
+}
+
+type vaultClient struct {
+	addr      string
+	kvPath    string
+	role      string
+	audience  string
+	jwtSource *workloadapi.JWTSource
+	client    *http.Client
+}
+
+func newVaultClient(addr, kvPath, role, audience string, jwtSource *workloadapi.JWTSource) *vaultClient {
+	if addr == "" || kvPath == "" || role == "" || audience == "" || jwtSource == nil {
+		return nil
+	}
+	return &vaultClient{
+		addr:      strings.TrimRight(addr, "/"),
+		kvPath:    strings.TrimPrefix(kvPath, "/"),
+		role:      role,
+		audience:  audience,
+		jwtSource: jwtSource,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+	}
+}
+
+func (v *vaultClient) ReadKV(ctx context.Context) (string, error) {
+	token, err := v.login(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, v.addr+"/v1/"+v.kvPath, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-Vault-Token", token)
+
+	resp, err := v.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("vault kv read failed with status %d", resp.StatusCode)
+	}
+
+	var parsed struct {
+		Data struct {
+			Data struct {
+				Message string `json:"message"`
+			} `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return "", err
+	}
+	return parsed.Data.Data.Message, nil
+}
+
+func (v *vaultClient) login(ctx context.Context) (string, error) {
+	jwtSVID, err := v.jwtSource.FetchJWTSVID(ctx, jwtsvid.Params{Audience: v.audience})
+	if err != nil {
+		return "", err
+	}
+	logJWTSVIDClaims(jwtSVID.Marshal())
+
+	payload, err := json.Marshal(map[string]string{
+		"role": v.role,
+		"type": "jwt",
+	})
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.addr+"/v1/auth/spiffe/login", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+jwtSVID.Marshal())
+
+	resp, err := v.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(resp.Body)
+		message := strings.TrimSpace(string(body))
+		if message != "" {
+			return "", fmt.Errorf("vault spiffe login failed with status %d: %s", resp.StatusCode, message)
+		}
+		return "", fmt.Errorf("vault spiffe login failed with status %d", resp.StatusCode)
+	}
+
+	var parsed struct {
+		Auth struct {
+			ClientToken string `json:"client_token"`
+		} `json:"auth"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return "", err
+	}
+	if parsed.Auth.ClientToken == "" {
+		return "", fmt.Errorf("vault spiffe login returned empty client token")
+	}
+	return parsed.Auth.ClientToken, nil
+}
+
+func logJWTSVIDClaims(token string) {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		log.Print("vault jwt svid claims: unable to parse token")
+		return
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		log.Printf("vault jwt svid claims: decode failed: %v", err)
+		return
+	}
+	var claims struct {
+		Sub string      `json:"sub"`
+		Aud interface{} `json:"aud"`
+		Exp int64       `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		log.Printf("vault jwt svid claims: unmarshal failed: %v", err)
+		return
+	}
+	log.Printf("vault jwt svid claims: sub=%s aud=%v exp=%d", claims.Sub, claims.Aud, claims.Exp)
 }

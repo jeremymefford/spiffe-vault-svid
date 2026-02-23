@@ -9,11 +9,23 @@ VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:18200}"
 : "${VAULT_TOKEN:?VAULT_TOKEN must be set}"
 : "${LAB_KEYSTORE_PASSWORD:?LAB_KEYSTORE_PASSWORD must be set}"
 LEGACY_SPIFFE_ID="${LEGACY_SPIFFE_ID:-spiffe://legacy.lab/ns/legacy/sa/springboot}"
+SVID_TTL="${LAB_SVID_TTL:-5m}"
+SVID_MAX_TTL="${LAB_SVID_MAX_TTL:-15m}"
+KV_MOUNT_PATH="kv"
+KV_SECRET_PATH="${LAB_VAULT_KV_PATH:-kv/data/legacy-app}"
 MODERN_URL="${LAB_MODERN_URL:-https://localhost:30443/hello}"
 VAULT_ADDR_NOMAD="${LAB_VAULT_ADDR_NOMAD:-http://host.docker.internal:18200}"
 MODERN_URL_NOMAD="${LAB_MODERN_URL_NOMAD:-https://host.docker.internal:30443/hello}"
 ROLE_NAME="legacy-app"
 PKI_ROLE_NAME="legacy-svid"
+SPIFFE_ROLE_NAME="modern-app"
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; exit 1; }
+}
+
+require curl
+require jq
 
 mkdir -p "${PKI_DIR}"
 
@@ -37,11 +49,6 @@ vault_request() {
       -H "X-Vault-Token: ${VAULT_TOKEN}" \
       "${VAULT_ADDR}${path}"
   fi
-}
-
-extract_json_value() {
-  local key="$1"
-  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n1
 }
 
 echo "Checking Vault readiness at ${VAULT_ADDR}"
@@ -81,7 +88,16 @@ curl -fsS -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/pki/ca/pem" > "${
 
 echo "Configuring role ${PKI_ROLE_NAME}"
 vault_request POST "/v1/pki/roles/${PKI_ROLE_NAME}" \
-  "{\"allow_any_name\":true,\"enforce_hostnames\":false,\"require_cn\":false,\"key_type\":\"rsa\",\"key_bits\":2048,\"ttl\":\"30m\",\"max_ttl\":\"1h\",\"key_usage\":\"DigitalSignature,KeyEncipherment,KeyAgreement\",\"ext_key_usage\":\"ServerAuth,ClientAuth\",\"allowed_uri_sans\":\"${LEGACY_SPIFFE_ID}\"}" >/dev/null
+  "{\"allow_any_name\":true,\"enforce_hostnames\":false,\"require_cn\":false,\"key_type\":\"rsa\",\"key_bits\":2048,\"ttl\":\"${SVID_TTL}\",\"max_ttl\":\"${SVID_MAX_TTL}\",\"key_usage\":\"DigitalSignature,KeyEncipherment,KeyAgreement\",\"ext_key_usage\":\"ServerAuth,ClientAuth\",\"allowed_uri_sans\":\"${LEGACY_SPIFFE_ID}\"}" >/dev/null
+
+kv_status_code="$(curl -s -o /dev/null -w '%{http_code}' -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/sys/mounts/${KV_MOUNT_PATH}/" || true)"
+if [[ "${kv_status_code}" == "404" || "${kv_status_code}" == "400" ]]; then
+  echo "Enabling KV v2 secrets engine"
+  vault_request POST "/v1/sys/mounts/${KV_MOUNT_PATH}" '{"type":"kv","options":{"version":"2"}}' >/dev/null
+fi
+
+echo "Writing KV v2 secret for legacy app"
+vault_request POST "/v1/${KV_SECRET_PATH}" '{"data":{"message":"hello from vault kv v2"}}' >/dev/null
 
 policy_file="$(mktemp)"
 cat > "${policy_file}" <<POLICY
@@ -92,12 +108,27 @@ path "pki/issue/${PKI_ROLE_NAME}" {
 path "pki/cert/ca" {
   capabilities = ["read"]
 }
+
+path "kv/data/legacy-app" {
+  capabilities = ["read"]
+}
 POLICY
 
 policy_escaped="$(escape_json_file "${policy_file}")"
 rm -f "${policy_file}"
 
 vault_request PUT "/v1/sys/policies/acl/${ROLE_NAME}" "{\"policy\":\"${policy_escaped}\"}" >/dev/null
+
+modern_policy_file="$(mktemp)"
+cat > "${modern_policy_file}" <<POLICY
+path "kv/data/legacy-app" {
+  capabilities = ["read"]
+}
+POLICY
+modern_policy_escaped="$(escape_json_file "${modern_policy_file}")"
+rm -f "${modern_policy_file}"
+
+vault_request PUT "/v1/sys/policies/acl/${SPIFFE_ROLE_NAME}" "{\"policy\":\"${modern_policy_escaped}\"}" >/dev/null
 
 auth_status="$(curl -s -o /dev/null -w '%{http_code}' -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/sys/auth/approle/")"
 if [[ "${auth_status}" == "404" || "${auth_status}" == "400" ]]; then
@@ -110,8 +141,8 @@ vault_request POST "/v1/auth/approle/role/${ROLE_NAME}" '{"token_policies":["leg
 role_id_json="$(vault_request GET "/v1/auth/approle/role/${ROLE_NAME}/role-id")"
 secret_id_json="$(vault_request POST "/v1/auth/approle/role/${ROLE_NAME}/secret-id" '{}')"
 
-ROLE_ID="$(printf '%s' "${role_id_json}" | extract_json_value role_id)"
-SECRET_ID="$(printf '%s' "${secret_id_json}" | extract_json_value secret_id)"
+ROLE_ID="$(printf '%s' "${role_id_json}" | jq -r '.data.role_id // empty')"
+SECRET_ID="$(printf '%s' "${secret_id_json}" | jq -r '.data.secret_id // empty')"
 
 if [[ -z "${ROLE_ID}" || -z "${SECRET_ID}" ]]; then
   echo "Failed to fetch AppRole credentials" >&2
@@ -127,6 +158,8 @@ export LAB_LEGACY_SPIFFE_ID=${LEGACY_SPIFFE_ID}
 export LAB_MODERN_URL=${MODERN_URL}
 export LAB_MODERN_URL_NOMAD=${MODERN_URL_NOMAD}
 export LAB_KEYSTORE_PASSWORD=${LAB_KEYSTORE_PASSWORD}
+export LAB_VAULT_KV_PATH=${KV_SECRET_PATH}
+export LAB_SVID_TTL=${SVID_TTL}
 ENV
 
 cp "${LEGACY_ROOT_CERT}" "${ROOT_DIR}/legacy-app/root-ca.crt"

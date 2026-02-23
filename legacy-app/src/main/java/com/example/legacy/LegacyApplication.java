@@ -25,10 +25,12 @@ import java.security.KeyPair;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.Security;
+import java.security.MessageDigest;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -54,9 +56,18 @@ public class LegacyApplication implements CommandLineRunner {
         String spiffeId = envOrDefault("LAB_LEGACY_SPIFFE_ID", "spiffe://legacy.lab/ns/legacy/sa/springboot");
         String modernUrl = envOrDefault("LAB_MODERN_URL", "https://localhost:30443/hello");
         String modernRootCaPem = normalizePem(envOrDefault("LAB_MODERN_ROOT_CA_PEM", ""));
+        String kvPath = envOrDefault("LAB_VAULT_KV_PATH", "kv/data/legacy-app");
+        String svidTtl = envOrDefault("LAB_SVID_TTL", "5m");
 
         String vaultToken = loginWithAppRole(vaultAddr, roleId, secretId);
-        IssuedSvid issuedSvid = mintSvid(vaultAddr, vaultToken, spiffeId);
+        IssuedSvid issuedSvid = mintSvid(vaultAddr, vaultToken, spiffeId, svidTtl);
+
+        logTrustBundle("Legacy app trust bundle (modern root)", modernRootCaPem);
+        logSvidMetadata("Vault-issued legacy SVID", issuedSvid.certificate());
+        String kvMessage = fetchKvMessage(vaultAddr, vaultToken, kvPath);
+        if (kvMessage != null) {
+            System.out.println("Legacy app KV v2 message: " + kvMessage);
+        }
 
         SSLContext sslContext = buildSslContext(
                 issuedSvid.certificate(),
@@ -101,11 +112,11 @@ public class LegacyApplication implements CommandLineRunner {
         return token.asText();
     }
 
-    private IssuedSvid mintSvid(String vaultAddr, String vaultToken, String spiffeId) throws Exception {
+    private IssuedSvid mintSvid(String vaultAddr, String vaultToken, String spiffeId, String ttl) throws Exception {
         String payload = mapper.createObjectNode()
                 .put("common_name", "legacy-app.lab")
                 .put("uri_sans", spiffeId)
-                .put("ttl", "30m")
+                .put("ttl", ttl)
                 .toString();
 
         HttpRequest request = HttpRequest.newBuilder(URI.create(vaultAddr + "/v1/pki/issue/legacy-svid"))
@@ -183,6 +194,18 @@ public class LegacyApplication implements CommandLineRunner {
         return parsed;
     }
 
+    private void logSvidMetadata(String label, String pem) throws Exception {
+        List<X509Certificate> certs = parseCertificates(pem);
+        if (certs.isEmpty()) {
+            return;
+        }
+        X509Certificate cert = certs.get(0);
+        Instant now = Instant.now();
+        Instant notAfter = cert.getNotAfter().toInstant();
+        long secondsLeft = Duration.between(now, notAfter).getSeconds();
+        System.out.println(label + " expires at " + cert.getNotAfter() + " (in " + secondsLeft + "s)");
+    }
+
     private PrivateKey parsePrivateKey(String privateKeyPem) throws Exception {
         try (PEMParser parser = new PEMParser(new StringReader(privateKeyPem))) {
             Object object = parser.readObject();
@@ -203,6 +226,25 @@ public class LegacyApplication implements CommandLineRunner {
         return HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
+    }
+
+    private String fetchKvMessage(String vaultAddr, String vaultToken, String kvPath) throws Exception {
+        String normalizedPath = kvPath.startsWith("/") ? kvPath.substring(1) : kvPath;
+        HttpRequest request = HttpRequest.newBuilder(URI.create(vaultAddr + "/v1/" + normalizedPath))
+                .timeout(Duration.ofSeconds(10))
+                .header("X-Vault-Token", vaultToken)
+                .GET()
+                .build();
+
+        HttpResponse<String> response = unauthenticatedClient().send(request, HttpResponse.BodyHandlers.ofString());
+        ensureSuccess(response, "Vault KV v2 read");
+
+        JsonNode data = mapper.readTree(response.body()).path("data").path("data");
+        JsonNode message = data.path("message");
+        if (message.isMissingNode() || message.asText().isBlank()) {
+            return null;
+        }
+        return message.asText();
     }
 
     private HttpRequest post(String url, String payload) {
@@ -246,6 +288,33 @@ public class LegacyApplication implements CommandLineRunner {
 
     private String normalizePem(String pem) {
         return pem.replace("\\n", "\n");
+    }
+
+    private void logTrustBundle(String label, String pem) throws Exception {
+        if (pem == null || pem.isBlank()) {
+            System.out.println(label + ": (not provided)");
+            return;
+        }
+        List<X509Certificate> certs = parseCertificates(pem);
+        for (int i = 0; i < certs.size(); i++) {
+            X509Certificate cert = certs.get(i);
+            String cn = cert.getSubjectX500Principal().getName();
+            String fp = sha256Fingerprint(cert);
+            System.out.println(label + " cert[" + i + "]: " + cn + " sha256=" + fp);
+        }
+    }
+
+    private String sha256Fingerprint(X509Certificate cert) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] hash = digest.digest(cert.getEncoded());
+        StringBuilder sb = new StringBuilder(hash.length * 3 - 1);
+        for (int i = 0; i < hash.length; i++) {
+            if (i > 0) {
+                sb.append(':');
+            }
+            sb.append(String.format("%02X", hash[i]));
+        }
+        return sb.toString();
     }
 
     private record IssuedSvid(String certificate, String privateKey, String issuingCa) {

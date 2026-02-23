@@ -39,3 +39,7 @@ if [[ -f "${NOMAD_PID_FILE}" ]]; then
   fi
   rm -f "${NOMAD_PID_FILE}"
 fi
+
+for cid in $(docker ps --filter "name=vault-" --format "{{.ID}}" 2>/dev/null || true); do
+  docker rm -f "${cid}" >/dev/null 2>&1 || true
+done

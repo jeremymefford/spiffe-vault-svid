@@ -40,6 +40,14 @@ spec:
               value: spiffe://legacy.lab/ns/legacy/sa/springboot
             - name: MODERN_SERVER_SPIFFE_ID
               value: spiffe://modern.lab/ns/modern/sa/go
+            - name: VAULT_ADDR
+              value: http://host.docker.internal:18200
+            - name: VAULT_KV_PATH
+              value: kv/data/legacy-app
+            - name: VAULT_SPIFFE_ROLE
+              value: modern-app
+            - name: SPIFFE_JWT_AUDIENCE
+              value: vault
           ports:
             - containerPort: 8443
               name: tls

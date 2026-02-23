@@ -130,8 +130,10 @@ else
   echo "3) Data plane: run legacy job and expect acceptance"
   "${ROOT_DIR}/scripts/run-legacy.sh" | tee "${tmp_dir}/legacy.out"
   print_modern_logs
-  rg -q "Modern app status: 200" "${tmp_dir}/legacy.out"
-  rg -q "accepted client spiffe://${LEGACY_TRUST_DOMAIN}/" "${tmp_dir}/legacy.out"
+  kubectl -n modern logs deploy/modern-app --tail=200 | grep -q "Vault KV v2 message:"
+  grep -q "Modern app status: 200" "${tmp_dir}/legacy.out"
+  grep -q "accepted client spiffe://${LEGACY_TRUST_DOMAIN}/" "${tmp_dir}/legacy.out"
+  grep -q "Legacy app KV v2 message:" "${tmp_dir}/legacy.out"
 fi
 
 echo "Federation verification complete."

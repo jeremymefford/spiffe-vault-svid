@@ -61,6 +61,8 @@ source "${ENV_FILE}"
 : "${LAB_VAULT_SECRET_ID:?LAB_VAULT_SECRET_ID is required}"
 : "${LAB_LEGACY_SPIFFE_ID:?LAB_LEGACY_SPIFFE_ID is required}"
 : "${LAB_KEYSTORE_PASSWORD:?LAB_KEYSTORE_PASSWORD is required}"
+: "${LAB_VAULT_KV_PATH:?LAB_VAULT_KV_PATH is required}"
+: "${LAB_SVID_TTL:?LAB_SVID_TTL is required}"
 
 LAB_VAULT_ADDR_NOMAD="${LAB_VAULT_ADDR_NOMAD:-http://host.docker.internal:18200}"
 LAB_MODERN_URL_NOMAD="${LAB_MODERN_URL_NOMAD:-https://host.docker.internal:30443/hello}"
@@ -95,6 +97,8 @@ sed \
   -e "s|__LAB_MODERN_URL_NOMAD__|$(escape_sed_replacement "${LAB_MODERN_URL_NOMAD}")|g" \
   -e "s|__LAB_MODERN_ROOT_CA_PEM__|$(escape_sed_replacement "${modern_root_ca_pem}")|g" \
   -e "s|__LAB_KEYSTORE_PASSWORD__|$(escape_sed_replacement "${LAB_KEYSTORE_PASSWORD}")|g" \
+  -e "s|__LAB_VAULT_KV_PATH__|$(escape_sed_replacement "${LAB_VAULT_KV_PATH}")|g" \
+  -e "s|__LAB_SVID_TTL__|$(escape_sed_replacement "${LAB_SVID_TTL}")|g" \
   "${JOB_TEMPLATE}" > "${JOB_RENDERED}"
 
 nomad job stop -purge -yes legacy-app >/dev/null 2>&1 || true

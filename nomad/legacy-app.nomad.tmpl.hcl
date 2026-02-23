@@ -24,6 +24,8 @@ job "legacy-app" {
         LAB_MODERN_URL       = "__LAB_MODERN_URL_NOMAD__"
         LAB_MODERN_ROOT_CA_PEM = "__LAB_MODERN_ROOT_CA_PEM__"
         LAB_KEYSTORE_PASSWORD = "__LAB_KEYSTORE_PASSWORD__"
+        LAB_VAULT_KV_PATH     = "__LAB_VAULT_KV_PATH__"
+        LAB_SVID_TTL          = "__LAB_SVID_TTL__"
       }
 
       resources {

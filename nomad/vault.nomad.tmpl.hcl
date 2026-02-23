@@ -14,19 +14,20 @@ job "vault" {
       driver = "docker"
 
       config {
-        image = "hashicorp/vault:1.18.3"
+        image = "hashicorp/vault-enterprise:1.21.2-ent"
         args = [
           "server",
-          "-dev",
-          "-dev-root-token-id=__LAB_VAULT_DEV_ROOT_TOKEN__",
-          "-dev-listen-address=0.0.0.0:8200",
+        ]
+        volumes = [
+          "vault-data:/vault/data",
         ]
         ports = ["http"]
       }
 
       env {
-        VAULT_DEV_ROOT_TOKEN_ID = "__LAB_VAULT_DEV_ROOT_TOKEN__"
         VAULT_ADDR              = "http://127.0.0.1:8200"
+        VAULT_LICENSE           = "__LAB_VAULT_LICENSE__"
+        VAULT_LOCAL_CONFIG      = "__LAB_VAULT_LOCAL_CONFIG__"
       }
 
       resources {
